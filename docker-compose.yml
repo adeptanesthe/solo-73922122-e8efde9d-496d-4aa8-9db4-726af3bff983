@@ -1,0 +1,7 @@
+services:
+  api:
+    build: .
+    image: film-verdict-api:local
+    ports:
+      - "8000:8000"
+    restart: unless-stopped

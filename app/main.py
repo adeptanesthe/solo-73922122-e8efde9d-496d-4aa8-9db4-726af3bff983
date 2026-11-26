@@ -94,6 +94,7 @@ def _plan_response(plan) -> dict[str, Any]:
         "plan_code": plan.code,
         "status": plan.status,
         "generation": plan.generation,
+        "revision": plan.revision,
         "coarse": plan.coarse.as_dict(),
         "instruments": plan.instruments_payload(),
         "assessment": {
@@ -196,11 +197,11 @@ def instrument_readings(plan_code: str, instrument_id: str) -> dict[str, Any]:
     )
     if instrument is None:
         raise ServiceError(404, "instrument_not_in_plan", "该仪表不在本方案号中")
-    report = engine.classify_instrument(
-        instrument, engine.collect_cells(plan.tree, plan.coarse), plan.coarse
-    )
+    # 直接复用方案创建/更正时按步长算好的分档结果，不逐台重算。
+    report = engine.report_from_profile(instrument, plan.step_profile(instrument.step))
     return {
         "plan_code": plan.code,
+        "status": plan.status,
         "instrument_id": instrument.id,
         "step": instrument.step,
         "usable": report["usable"],

@@ -398,13 +398,62 @@ def _check_instrument(instrument: Instrument) -> None:
         raise ValueError("仪表编号必须是整数或字符串")
 
 
-def classify_instrument(
-    instrument: Instrument, cells: list[Cell], coarse: CoarseRange
-) -> dict[str, Any]:
-    """判定单台仪表，返回可直接序列化的报告。"""
+@dataclass(frozen=True)
+class StepProfile:
+    """某个步长下的分档结果，与具体仪表编号无关。
 
-    _check_instrument(instrument)
-    step = instrument.step
+    同一方案号内相同步长的所有仪表共用一份：档值区间、同档异判的交集和
+    见证都只算一次。查询方案、查询档值和提交精测都直接复用，不再逐台重算。
+    """
+
+    step: int
+    pass_intervals: tuple[tuple[int, int], ...]
+    rework_intervals: tuple[tuple[int, int], ...]
+    conflicts: tuple[tuple[int, int], ...]
+    conflict_template: Optional[dict[str, Any]]
+    possible_reading_count: int
+
+    def verdict_for(self, reading: int) -> Optional[Verdict]:
+        """实测档值唯一对应的判定；不可行或同档两判时返回 None。"""
+
+        if (
+            not _is_int(reading)
+            or reading < 0
+            or reading % self.step != 0
+        ):
+            return None
+        index = reading // self.step
+        found: set[Verdict] = set()
+        if any(lo <= index <= hi for lo, hi in self.pass_intervals):
+            found.add("pass")
+        if any(lo <= index <= hi for lo, hi in self.rework_intervals):
+            found.add("rework")
+        return found.pop() if len(found) == 1 else None
+
+    def intervals_payload(self) -> list[dict[str, Any]]:
+        intervals = [
+            {
+                "verdict": verdict,
+                "from_reading": lo * self.step,
+                "to_reading": hi * self.step,
+            }
+            for verdict, spans in (
+                ("pass", self.pass_intervals),
+                ("rework", self.rework_intervals),
+            )
+            for lo, hi in spans
+        ]
+        intervals.sort(key=lambda item: item["from_reading"])
+        return intervals
+
+
+def build_step_profile(
+    cells: list[Cell], coarse: CoarseRange, step: int
+) -> StepProfile:
+    """把一个步长的分档只计算一次，得到可复用的 :class:`StepProfile`。"""
+
+    if not _is_int(step) or step <= 0:
+        raise ValueError("仪表步长必须是正整数")
 
     by_verdict: dict[str, list[tuple[int, int]]] = {"pass": [], "rework": []}
     cell_spans: list[tuple[Cell, tuple[int, int]]] = []
@@ -419,6 +468,7 @@ def classify_instrument(
     rework_intervals = _merge(by_verdict["rework"])
     conflicts = _intersect(pass_intervals, rework_intervals)
 
+    conflict_template: Optional[dict[str, Any]] = None
     if conflicts:
         reading_index = conflicts[0][0]
         pass_cell = next(
@@ -458,35 +508,137 @@ def classify_instrument(
         if samples[0]["verdict"] == samples[1]["verdict"]:  # pragma: no cover
             raise AssertionError("同档见证点判定相同")
         reading = reading_index * step
-        return {
-            "instrument_id": instrument.id,
-            "step": step,
-            "usable": False,
-            "conflict": {
-                "reading": reading,
-                "reading_class": [reading, reading + step - 1],
-                "conflict_reading_count": _count(conflicts),
-                "samples": samples,
-            },
+        conflict_template = {
+            "reading": reading,
+            "reading_class": [reading, reading + step - 1],
+            "conflict_reading_count": _count(conflicts),
+            "samples": samples,
         }
 
-    intervals = [
-        {
-            "verdict": verdict,
-            "from_reading": lo * step,
-            "to_reading": hi * step,
+    return StepProfile(
+        step=step,
+        pass_intervals=tuple(pass_intervals),
+        rework_intervals=tuple(rework_intervals),
+        conflicts=tuple(conflicts),
+        conflict_template=conflict_template,
+        possible_reading_count=_count(pass_intervals) + _count(rework_intervals),
+    )
+
+
+def _copy_conflict(template: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "reading": template["reading"],
+        "reading_class": list(template["reading_class"]),
+        "conflict_reading_count": template["conflict_reading_count"],
+        "samples": [dict(sample) for sample in template["samples"]],
+    }
+
+
+def report_from_profile(
+    instrument: Instrument, profile: StepProfile
+) -> dict[str, Any]:
+    """用共享的分档结果生成某台仪表自己的报告（保留自己的编号）。"""
+
+    _check_instrument(instrument)
+    if instrument.step != profile.step:  # pragma: no cover - 调用方保证一致
+        raise ValueError("仪表步长与分档结果不一致")
+
+    if profile.conflicts:
+        if profile.conflict_template is None:  # pragma: no cover
+            raise AssertionError("存在冲突档值却没有见证")
+        return {
+            "instrument_id": instrument.id,
+            "step": instrument.step,
+            "usable": False,
+            "conflict": _copy_conflict(profile.conflict_template),
         }
-        for verdict in ("pass", "rework")
-        for lo, hi in (pass_intervals if verdict == "pass" else rework_intervals)
-    ]
-    intervals.sort(key=lambda item: item["from_reading"])
     return {
         "instrument_id": instrument.id,
-        "step": step,
+        "step": instrument.step,
         "usable": True,
-        "reading_intervals": intervals,
-        "possible_reading_count": _count(pass_intervals) + _count(rework_intervals),
+        "reading_intervals": profile.intervals_payload(),
+        "possible_reading_count": profile.possible_reading_count,
     }
+
+
+def classify_instrument(
+    instrument: Instrument, cells: list[Cell], coarse: CoarseRange
+) -> dict[str, Any]:
+    """判定单台仪表，返回可直接序列化的报告。"""
+
+    _check_instrument(instrument)
+    return report_from_profile(
+        instrument, build_step_profile(cells, coarse, instrument.step)
+    )
+
+
+@dataclass(frozen=True)
+class CompiledAnalysis:
+    """一个方案号评估结果的一次性编译产物。
+
+    判定树按粗测范围裁剪一次，每种步长只分档一次；各仪表的报告也在这里
+    生成并缓存。后续查询方案、查询档值和提交精测都只读这份结果。
+    """
+
+    range_feasible: bool
+    range_error: Optional[str]
+    solvable: bool
+    cells: tuple[Cell, ...]
+    profiles: dict[int, StepProfile]
+    instrument_reports: tuple[dict[str, Any], ...]
+    usable_instruments: tuple[dict[str, Any], ...]
+    unusable_instruments: tuple[dict[str, Any], ...]
+    usable_ids: frozenset[Any]
+    distinct_steps: int
+
+
+def build_analysis(
+    coarse: CoarseRange, root: Node, instruments: list[Instrument]
+) -> CompiledAnalysis:
+    """一次性完成树裁剪与按步长分档，供方案全生命周期复用。"""
+
+    range_error = coarse.error()
+    if range_error is not None:
+        return CompiledAnalysis(
+            range_feasible=False,
+            range_error=range_error,
+            solvable=False,
+            cells=(),
+            profiles={},
+            instrument_reports=(),
+            usable_instruments=(),
+            unusable_instruments=(),
+            usable_ids=frozenset(),
+            distinct_steps=0,
+        )
+
+    cells = tuple(collect_cells(root, coarse))
+    profiles: dict[int, StepProfile] = {}
+    reports: list[dict[str, Any]] = []
+    usable: list[dict[str, Any]] = []
+    unusable: list[dict[str, Any]] = []
+    for instrument in instruments:
+        _check_instrument(instrument)
+        profile = profiles.get(instrument.step)
+        if profile is None:
+            profile = build_step_profile(list(cells), coarse, instrument.step)
+            profiles[instrument.step] = profile
+        report = report_from_profile(instrument, profile)
+        reports.append(report)
+        (usable if report["usable"] else unusable).append(report)
+
+    return CompiledAnalysis(
+        range_feasible=True,
+        range_error=None,
+        solvable=bool(usable),
+        cells=cells,
+        profiles=profiles,
+        instrument_reports=tuple(reports),
+        usable_instruments=tuple(usable),
+        unusable_instruments=tuple(unusable),
+        usable_ids=frozenset(report["instrument_id"] for report in usable),
+        distinct_steps=len(profiles),
+    )
 
 
 def assess(
@@ -494,21 +646,14 @@ def assess(
 ) -> dict[str, Any]:
     """评估整份方案：范围是否有解、各仪表是否合用、不合用见证。"""
 
-    range_error = coarse.error()
-    usable: list[dict[str, Any]] = []
-    unusable: list[dict[str, Any]] = []
-    if range_error is None:
-        cells = collect_cells(root, coarse)
-        for instrument in instruments:
-            report = classify_instrument(instrument, cells, coarse)
-            (usable if report["usable"] else unusable).append(report)
+    compiled = build_analysis(coarse, root, instruments)
     return {
-        "range_feasible": range_error is None,
-        "range_error": range_error,
+        "range_feasible": compiled.range_feasible,
+        "range_error": compiled.range_error,
         # 方案可执行 = 范围有解且至少有一台仪表能保证同档同判。
-        "solvable": range_error is None and bool(usable),
-        "usable_instruments": usable,
-        "unusable_instruments": unusable,
+        "solvable": compiled.solvable,
+        "usable_instruments": list(compiled.usable_instruments),
+        "unusable_instruments": list(compiled.unusable_instruments),
     }
 
 
@@ -520,23 +665,15 @@ def reading_verdict(
 ) -> Optional[Verdict]:
     """给定某台仪表的实测档值，返回唯一判定；档值不可行/不唯一返回 None。
 
-    档值必须已是步长的整倍数（仪表读数天然如此）。这里重新检查该档值
-    覆盖的所有可行点，不依赖调用顺序。
+    档值必须已是步长的整倍数（仪表读数天然如此）。这里按步长重新分档一次，
+    语义与方案缓存一致；服务层提交精测时直接复用缓存的 StepProfile。
     """
 
     _check_instrument(instrument)
-    step = instrument.step
-    if not _is_int(reading) or reading < 0 or reading % step != 0:
-        return None
-    index = reading // step
-    verdicts: set[Verdict] = set()
-    for cell in collect_cells(root, coarse):
-        span = cell_reading_span(cell, step, coarse)
-        if span is not None and span[0] <= index <= span[1]:
-            verdicts.add(cell.verdict)
-    if len(verdicts) == 1:
-        return verdicts.pop()
-    return None
+    profile = build_step_profile(
+        collect_cells(root, coarse), coarse, instrument.step
+    )
+    return profile.verdict_for(reading)
 
 
 def reading_class(
